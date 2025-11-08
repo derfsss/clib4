@@ -37,10 +37,10 @@
 #define WMEM_BLOCK_MAX_ALLOC_SIZE (WMEM_BLOCK_SIZE - (WMEM_BLOCK_HEADER_SIZE + WMEM_CHUNK_HEADER_SIZE))
 
 /* When required, allocate more memory from the OS in chunks of this size.
- * 2MB is a pretty arbitrary value - it's big enough that it should last a while
+ * 1MB is a pretty arbitrary value - it's big enough that it should last a while
  * and small enough that a mostly-unused one doesn't waste *too* much. It's
  * also a nice power of two, of course. */
-#define WMEM_BLOCK_SIZE (2 * 1024 * 1024)
+#define WMEM_BLOCK_SIZE (1024 * 1024)
 
 /* The header for an entire OS-level 'block' of memory */
 typedef struct _wmem_block_fast_hdr {
