@@ -139,6 +139,7 @@ const struct Resident RomTag;
 static struct TimeRequest *openTimer(uint32 unit);
 static void closeTimer(struct TimeRequest *tr);
 static int32 getDebugLevel(struct ExecBase *sysbase);
+static struct Clib4Resource *recreateClib4Resource(struct ExecIFace *iexec);
 
 extern void reent_exit(struct _clib4 *__clib4);
 extern void reent_init(struct _clib4 *__clib4, BOOL fallback);
@@ -388,21 +389,36 @@ struct Clib4Library *libOpen(struct LibraryManagerInterface *Self, uint32 versio
 
     DECLARE_UTILITYBASE();
 
-	struct Library *ExpansionBase = IExec->OpenLibrary("expansion.library", 53L);
-	if (ExpansionBase == NULL) {
-		SHOWMSG("Cannot open expansopn library!");
-		return NULL;
-	}
+    struct Library *ExpansionBase = NULL;
+    struct ExpansionIFace *IExpansion = NULL;
 
-	struct ExpansionIFace *IExpansion = (struct ExpansionIFace *) (IExec->GetInterface((struct Library *) ExpansionBase, "main", 1, NULL));
-	if (!IExpansion) {
-		SHOWMSG("Cannot obtain expansion interface!");
-		IExec->CloseLibrary(ExpansionBase);
-		ExpansionBase = NULL;
-		return NULL;
-	}
+    ExpansionBase = IExec->OpenLibrary("expansion.library", 53L);
+    if (ExpansionBase == NULL) {
+        SHOWMSG("Cannot open expansopn library!");
+        goto fail;
+    }
+
+    IExpansion = (struct ExpansionIFace *) (IExec->GetInterface((struct Library *) ExpansionBase, "main", 1, NULL));
+    if (!IExpansion) {
+        SHOWMSG("Cannot obtain expansion interface!");
+        goto fail;
+    }
 
     struct Clib4Resource *res = (APTR) IExec->OpenResource(RESOURCE_NAME);
+    if (res == NULL) {
+        /* clib4.resource is normally created once in libInit() and lives
+         * until the library is truly expunged.  If it is gone (an older
+         * library build's Expunge destroyed it on a memory flush while the
+         * library was still open), recreate it now — without it this open
+         * would half-succeed with no per-process _clib4 and the new process
+         * would crash on a NULL dereference before reaching main(). */
+        SHOWMSG("clib4.resource is missing - trying to recreate it");
+        res = recreateClib4Resource(IExec);
+        if (res == NULL) {
+            SHOWMSG("Cannot recreate clib4.resource!");
+            goto fail;
+        }
+    }
     uint32 pid;
     if (res) {
         /*
@@ -450,10 +466,19 @@ struct Clib4Library *libOpen(struct LibraryManagerInterface *Self, uint32 versio
         c2n.undo = 0;
         /* Initialize processes hashmap */
         c2n.spawnedProcesses = hashmap_new(sizeof(struct Clib4Children), 0, 0, 0, clib4IntHash, clib4ProcessCompare, NULL, NULL);
+        if (c2n.spawnedProcesses == NULL) {
+            SHOWMSG("Cannot allocate the spawned-processes hashmap!");
+            goto fail;
+        }
         D(bug("(libOpen) c2n.pid = %ld\n", c2n.pid));
         D(bug("(libOpen) c2n.pPid = %ld\n", c2n.pPid));
         D(bug("(libOpen) c2n.uuid = %s\n", c2n.uuid));
         hashmap_set(res->children, &c2n);
+        if (hashmap_oom(res->children)) {
+            SHOWMSG("Cannot register the process node in clib4.resource!");
+            hashmap_free(c2n.spawnedProcesses);
+            goto fail;
+        }
 
         D(bug("(libOpen) Enabling clib4 optimizations\n"));
         switch (res->cpufamily) {
@@ -623,6 +648,11 @@ struct Clib4Library *libOpen(struct LibraryManagerInterface *Self, uint32 versio
             __clib4->__fully_initialized = TRUE;
             __clib4->__lib_open_count = 1;
             SHOWMSG("Library initialized");
+        } else {
+            SHOWMSG("Cannot allocate the per-process _clib4 structure!");
+            hashmap_delete(res->children, &c2n);
+            hashmap_free(c2n.spawnedProcesses);
+            goto fail;
         }
     }
 	if (IExpansion != NULL) {
@@ -636,10 +666,49 @@ struct Clib4Library *libOpen(struct LibraryManagerInterface *Self, uint32 versio
 	}
 
     return libBase;
+
+fail:
+    /* Failure path: undo, in reverse order, exactly what this open acquired
+     * before the failure point, then fail the OpenLibrary() call outright.
+     * Returning libBase with no per-process _clib4 set up would only defer
+     * the crash: the startup code would dereference a NULL __clib4 before
+     * reaching main() (see _main()). */
+    if (IExpansion != NULL) {
+        IExec->DropInterface((struct Interface *) IExpansion);
+        IExpansion = NULL;
+    }
+
+    if (ExpansionBase != NULL) {
+        IExec->CloseLibrary(ExpansionBase);
+        ExpansionBase = NULL;
+    }
+
+    --libBase->libNode.lib_OpenCnt;
+
+    return NULL;
 }
 
 BPTR libExpunge(struct LibraryManagerInterface *Self) {
     BPTR result = 0;
+
+    struct Clib4Library *libBase = (struct Clib4Library *) Self->Data.LibBase;
+
+    /* Exec/ramlib invoke the Expunge vector on EVERY system-wide memory
+     * flush (any failed AllocMem anywhere in the system, or an explicit
+     * "Avail FLUSH"), regardless of how many clients still have the
+     * library open.  The in-use check therefore MUST come before ANY
+     * teardown: destroying clib4.resource (children hashmap, fallback
+     * clib, SysV IPC maps, shared wmem allocator) while the library is
+     * still open corrupts live state of every running clib4 program and
+     * removes the resource for every subsequently launched one — each
+     * new process then finds no resource in libOpen() and would crash on
+     * a NULL __clib4 before reaching main(), system-wide until reboot.
+     * Teardown is only allowed on the true-expunge path below, once
+     * lib_OpenCnt has dropped to zero. */
+    if (libBase->libNode.lib_OpenCnt) {
+        libBase->libNode.lib_Flags |= LIBF_DELEXP;
+        return result;
+    }
 
     struct Clib4Resource *res = (APTR) IExec->OpenResource(RESOURCE_NAME);
     if (res) {
@@ -670,12 +739,6 @@ BPTR libExpunge(struct LibraryManagerInterface *Self) {
 
         IExec->RemResource(res);
         IExec->FreeVec(res);
-    }
-
-    struct Clib4Library *libBase = (struct Clib4Library *) Self->Data.LibBase;
-    if (libBase->libNode.lib_OpenCnt) {
-        libBase->libNode.lib_Flags |= LIBF_DELEXP;
-        return result;
     }
 
     closeLibraries();
@@ -915,6 +978,65 @@ clib4ProcessCompare(const void *a, const void *b, void *udata) {
     return ua->pid - ub->pid;
 }
 
+/* Create, initialize and register clib4.resource.  Factored out of libInit()
+ * so that libOpen() can recreate the resource if it is found missing (e.g.
+ * an older library build's Expunge destroyed it on a memory flush while the
+ * library was still open).  Returns the resource, or NULL if the allocation
+ * failed. */
+static struct Clib4Resource *recreateClib4Resource(struct ExecIFace *iexec) {
+    struct Clib4Resource *res = iexec->AllocVecTags(
+            sizeof(struct Clib4Resource),
+            AVT_Type, MEMF_SHARED,
+            AVT_ClearWithValue, 0,
+            AVT_Lock, TRUE,
+            TAG_END);
+
+    if (res) {
+        res->resource.lib_Version = VERSION;
+        res->resource.lib_Revision = REVISION;
+        res->resource.lib_IdString = (STRPTR) RESOURCE_NAME;
+        res->resource.lib_Node.ln_Name = (STRPTR) RESOURCE_NAME;
+        res->resource.lib_Node.ln_Type = NT_RESOURCE;
+
+        iexec->InitSemaphore(&res->semaphore);
+        res->debugLevel = getDebugLevel(SysBase);
+        D(bug("(recreateClib4Resource) Current Exec debug level: %ld\n", res->debugLevel));
+        /* Initialize clib4 children hashmap */
+        res->children = hashmap_new(sizeof(struct Clib4Node), 0, 0, 0, clib4NodeHash, clib4NodeCompare, NULL, NULL);
+        /* Initialize unix sockets hashmap */
+        res->uxSocketsMap = hashmap_new(sizeof(struct UnixSocket), 0, 0, 0, unixSocketHash, unixSocketCompare, NULL, NULL);
+
+        /* Initialize fallback clib4 reent structure */
+        res->fallbackClib = (struct _clib4 *) iexec->AllocVecTags(sizeof(struct _clib4),
+                                                                  AVT_Type, MEMF_SHARED,
+                                                                  AVT_ClearWithValue, 0,
+                                                                  TAG_DONE);
+        reent_init(res->fallbackClib, TRUE);
+        res->fallbackClib->self = (struct Process *) IExec->FindTask(NULL);
+        res->fallbackClib->__check_abort_enabled = TRUE;
+        res->fallbackClib->__fully_initialized = TRUE;
+        ITimer->GetSysTime((struct TimeVal *) &res->fallbackClib->clock);
+
+        /* Init SYSV structures */
+        IPCMapInit(&res->shmcx.keymap);
+        res->shmcx.totshm = 0;
+        res->shmcx.shmmax = DEF_SHMMAX;
+        res->msgcx.qsizemax = DEF_QSIZEMAX;
+        IPCMapInit(&res->msgcx.keymap);
+        IPCMapInit(&res->semcx.keymap);
+
+        IExec->GetCPUInfoTags(
+                GCIT_VectorUnit, &res->altivec,
+                GCIT_Family, &res->cpufamily,
+                TAG_DONE);
+
+        res->size = sizeof(*res);
+        iexec->AddResource(res);
+    }
+
+    return res;
+}
+
 struct Clib4Library *libInit(struct Clib4Library *libBase, BPTR seglist, struct ExecIFace *const iexec) {
     libBase->libNode.lib_Node.ln_Type = NT_LIBRARY;
     libBase->libNode.lib_Node.ln_Pri = LIBPRI;
@@ -976,55 +1098,8 @@ struct Clib4Library *libInit(struct Clib4Library *libBase, BPTR seglist, struct 
     /* Open resource */
     struct Clib4Resource *res = (APTR) iexec->OpenResource(RESOURCE_NAME);
     if (!res) {
-        res = iexec->AllocVecTags(
-                sizeof(struct Clib4Resource),
-                AVT_Type, MEMF_SHARED,
-                AVT_ClearWithValue, 0,
-                AVT_Lock, TRUE,
-                TAG_END);
-
-        if (res) {
-            res->resource.lib_Version = VERSION;
-            res->resource.lib_Revision = REVISION;
-            res->resource.lib_IdString = (STRPTR) RESOURCE_NAME;
-            res->resource.lib_Node.ln_Name = (STRPTR) RESOURCE_NAME;
-            res->resource.lib_Node.ln_Type = NT_RESOURCE;
-
-            iexec->InitSemaphore(&res->semaphore);
-            res->debugLevel = getDebugLevel(SysBase);
-            D(bug("(libInit) Current Exec debug level: %ld\n", res->debugLevel));
-            /* Initialize clib4 children hashmap */
-            res->children = hashmap_new(sizeof(struct Clib4Node), 0, 0, 0, clib4NodeHash, clib4NodeCompare, NULL, NULL);
-            /* Initialize unix sockets hashmap */
-            res->uxSocketsMap = hashmap_new(sizeof(struct UnixSocket), 0, 0, 0, unixSocketHash, unixSocketCompare, NULL, NULL);
-
-            /* Initialize fallback clib4 reent structure */
-            res->fallbackClib = (struct _clib4 *) iexec->AllocVecTags(sizeof(struct _clib4),
-                                                                      AVT_Type, MEMF_SHARED,
-                                                                      AVT_ClearWithValue, 0,
-                                                                      TAG_DONE);
-            reent_init(res->fallbackClib, TRUE);
-            res->fallbackClib->self = (struct Process *) IExec->FindTask(NULL);
-            res->fallbackClib->__check_abort_enabled = TRUE;
-            res->fallbackClib->__fully_initialized = TRUE;
-            ITimer->GetSysTime((struct TimeVal *) &res->fallbackClib->clock);
-
-            /* Init SYSV structures */
-            IPCMapInit(&res->shmcx.keymap);
-            res->shmcx.totshm = 0;
-            res->shmcx.shmmax = DEF_SHMMAX;
-            res->msgcx.qsizemax = DEF_QSIZEMAX;
-            IPCMapInit(&res->msgcx.keymap);
-            IPCMapInit(&res->semcx.keymap);
-
-            IExec->GetCPUInfoTags(
-                    GCIT_VectorUnit, &res->altivec,
-                    GCIT_Family, &res->cpufamily,
-                    TAG_DONE);
-
-            res->size = sizeof(*res);
-            iexec->AddResource(res);
-        } else {
+        res = recreateClib4Resource(iexec);
+        if (!res) {
             goto out;
         }
     }

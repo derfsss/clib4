@@ -175,6 +175,13 @@ _main(
     int rc = RETURN_FAIL;
     struct _clib4 *__clib4 = __CLIB4;
 
+    /* If the library open half-failed (e.g. clib4.resource was destroyed by
+     * an unbalanced Expunge on a memory flush) there is no per-process
+     * context and no fallback: bail out cleanly instead of dereferencing
+     * NULL before main() is even reached. */
+    if (__clib4 == NULL)
+        return RETURN_FAIL;
+
     /* Store old Clib4Data */
     me = (struct Process *) FindTask(NULL);
     oldClib4Data = (APTR) me->pr_UID;
