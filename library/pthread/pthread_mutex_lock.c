@@ -63,8 +63,52 @@ pthread_mutex_lock(pthread_mutex_t *mutex) {
 		return EDEADLK;
 	}
 
-    SHOWMSG("MutexObtain");
-    MutexObtain(mutex->mutex);
+    /*
+     * Blocking tail.  Exec's MutexObtain() waits inside the kernel with no
+     * signal mask, so a thread parked in it can never be woken by the
+     * signal-based pthread_cancel() mechanism — __pthread_exit_func's join
+     * loop then wedges forever on process exit (there is no SIGKILL on
+     * AmigaOS).  To keep cancellation deliverable we wait with
+     * MutexAttemptWithSignal() (the same primitive pthread_mutex_timedlock
+     * relies on), including the thread's dedicated cancel signal, and run
+     * pthread_testcancel() whenever it fires.
+     *
+     * NOTE: POSIX says pthread_mutex_lock is NOT a cancellation point; this
+     * is a deliberate deviation (deferred cancel only, honoring
+     * pthread_setcancelstate).  Threads already TERMINATING/DESTRUCT (i.e.
+     * running cancellation-cleanup handlers, which routinely relock
+     * mutexes) fall back to the plain uninterruptible MutexObtain(), and
+     * pthread_exit()'s re-entry check guards against testcancel recursion.
+     */
+    ThreadInfo *inf = GetCurrentThreadInfo();
+    uint32 cancel_mask = 0;
+
+    if (inf != NULL &&
+        inf->cancelstate == PTHREAD_CANCEL_ENABLE &&
+        inf->status != THREAD_STATE_TERMINATING &&
+        inf->status != THREAD_STATE_DESTRUCT)
+        cancel_mask = inf->cancel_signal_mask;
+
+    if (cancel_mask == 0) {
+        SHOWMSG("MutexObtain");
+        MutexObtain(mutex->mutex);
+    } else {
+        /* Hardening: if a cancellation was flagged but its wake-up signal
+         * was already consumed before we got here (e.g. by an unrelated
+         * Wait/sigtimedwait), the loop below would park uncancellably —
+         * test once before the first wait to close that window. */
+        pthread_testcancel();
+        SHOWMSG("MutexAttemptWithSignal");
+        for (;;) {
+            uint32 sigs = MutexAttemptWithSignal(mutex->mutex, cancel_mask);
+            if (!(sigs & cancel_mask))
+                break;                          /* mutex acquired */
+            /* Woken by the cancel signal.  If a real cancellation is
+             * pending this exits the thread (deferred-cancel style);
+             * otherwise it clears the signal and we re-wait. */
+            pthread_testcancel();
+        }
+    }
     mutex->owner = FindTask(NULL);
     SHOWMSG("Done");
 
