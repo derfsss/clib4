@@ -9,11 +9,16 @@
 #include <sys/mman.h>
 #include <proto/exec.h>
 #include <exec/memory.h>
+#include <interfaces/exec.h>
 #include "mmap_internal.h"
 
 #ifndef _STDLIB_MEMORY_H
 #include "stdlib_memory.h"
 #endif
+
+#ifndef _STDLIB_CONSTRUCTOR_H
+#include "stdlib_constructor.h"
+#endif /* _STDLIB_CONSTRUCTOR_H */
 
 /* Process-global tracking list — one entry per live mmap() allocation.
  * Protected by the clib4 memory mutex (__memory_lock/__memory_unlock).
@@ -170,6 +175,8 @@ mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
         rec->alloc_base = block;
         rec->exec_alloc = exec_alloc;
         rec->fd         = hdr->fd;
+        rec->owner      = __CLIB4;
+        rec->owner_pid  = __CLIB4 ? (uint32_t) __CLIB4->processId : 0;
         rec->next       = NULL;
         __memory_lock(__CLIB4);
         rec->next       = __mmap_records;
@@ -180,4 +187,109 @@ mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
 
     RETURN(user_ptr);
     return user_ptr;
+}
+
+/*
+ * Restore MEMATTRF_READ_WRITE over a mapping's user pages before its backing
+ * block is FreeVec'd.
+ *
+ * If the process mprotect()'d pages inside the mapping (e.g. guard pages) to
+ * PROT_READ or PROT_NONE and the block is then FreeVec'd, exec.library may
+ * later write free-list metadata into those still-protected pages from
+ * kernel context — a DSI that silently suspends the task (the same hazard
+ * the "do NOT mprotect here" comment in mmap() describes).
+ *
+ * The check reads the validated in-page header at (user_ptr - header size)
+ * — the same pattern mprotect() uses — which lives in our own header page
+ * and is never itself protected.  Kept cheap: the MMU interface is only
+ * touched when hdr->prot lost PROT_WRITE (PROT_WRITE always maps to
+ * MEMATTRF_READ_WRITE, so RW mappings — the overwhelmingly common case —
+ * need no work).  An unreadable/invalid header skips the restore and the
+ * free proceeds exactly as before.
+ *
+ * The MMU sequence (GetInterface "mmu" / SuperState / SetMemoryAttrs /
+ * UserState / DropInterface, with UserState only when SuperState returned
+ * non-NULL) mirrors mprotect() exactly.
+ */
+void
+__mmap_restore_rw(void *user_ptr) {
+    struct mmap_header *hdr = __mmap_get_header(user_ptr);
+
+    if (hdr == NULL)
+        return;     /* header unreadable/invalid: free as-is (old behavior) */
+    if (hdr->prot & PROT_WRITE)
+        return;     /* MMU already MEMATTRF_READ_WRITE — common case */
+
+    struct MMUIFace *IMMU = (struct MMUIFace *)
+        GetInterface((struct Library *)IExec->Data.LibBase, "mmu", 1, NULL);
+
+    if (IMMU != NULL) {
+        APTR stack = SuperState();
+        ULONG current = GetMemoryAttrs(user_ptr, 0);
+        if (current != 0) {
+            /* Keep cache/coherency/execute bits; force the RW field to RW */
+            ULONG attrs = (current & ~((ULONG)MEMATTRF_RW_MASK)) | MEMATTRF_READ_WRITE;
+            SetMemoryAttrs(user_ptr, (ULONG)hdr->length, attrs);
+        }
+        if (stack != NULL) {
+            UserState(stack);
+        }
+        DropInterface((struct Interface *)IMMU);
+    }
+}
+
+/*
+ * Free every tracking record (and its AllocVecTags backing block) that was
+ * created by the given per-process context.
+ *
+ * Rationale: AllocVecTags memory has no per-process resource tracking on
+ * AmigaOS — it survives process exit until explicitly freed.  In the
+ * clib4.library build __mmap_records is a single system-wide list, so any
+ * mapping a process failed to munmap() (including "unmapped" interior
+ * pointers, which munmap() silently ignores) would otherwise leak until
+ * reboot.
+ */
+void
+__mmap_records_free_for(struct _clib4 *owner) {
+    struct mmap_record * volatile *pp;
+    struct mmap_record *rec;
+    struct _clib4 *__clib4 = __CLIB4;
+
+    ENTER();
+
+    SHOWPOINTER(owner);
+
+    __memory_lock(__clib4);     /* takes the system-global semaphore too */
+    pp = &__mmap_records;
+    while ((rec = *pp) != NULL) {
+        if (rec->owner == owner) {
+            *pp = rec->next;
+            D(("freeing leaked mmap record %p (user_ptr=%p, pid=%lu)",
+               rec, rec->user_ptr, (unsigned long) rec->owner_pid));
+            /* Do NOT close(rec->fd) here: the dup'd fd belongs to the dying
+             * process's fd table, which its own fd teardown closes; calling
+             * close() from a destructor risks ordering hazards vs FILE dtors. */
+            /* If the process left pages inside this mapping under restrictive
+             * MMU protection (guard pages it never munmap'd), FreeVec on them
+             * would DSI in kernel context — restore RW first. */
+            __mmap_restore_rw(rec->user_ptr);
+            FreeVec(rec->alloc_base);
+            FreeVec(rec);
+        } else {
+            pp = &rec->next;
+        }
+    }
+    __memory_unlock(__clib4);
+
+    LEAVE();
+}
+
+STDLIB_DESTRUCTOR(stdlib_mmap_exit) {
+    ENTER();
+    struct _clib4 *__clib4 = __CLIB4;
+
+    if (__clib4 != NULL)
+        __mmap_records_free_for(__clib4);
+
+    LEAVE();
 }

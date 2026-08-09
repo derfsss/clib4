@@ -25,6 +25,8 @@
 #define MMAP_MAGIC      0x4D4D4150  /* "MMAP" */
 #define MMAP_PAGE_SIZE  4096UL      /* AmigaOS 4 MMU page size */
 
+struct _clib4;
+
 struct mmap_header {
     uint32_t magic;     /* MMAP_MAGIC for validation */
     void    *alloc_base;/* original memalign()'d / AllocVecTags'd pointer */
@@ -48,6 +50,8 @@ struct mmap_record {
     void               *alloc_base; /* original memalign / AllocVecTags   */
     int                 exec_alloc; /* non-zero → free with FreeVec()     */
     int                 fd;         /* dup()'d file descriptor, or -1     */
+    struct _clib4      *owner;      /* per-process context that created it */
+    uint32_t            owner_pid;  /* diagnostics / orphan sweep          */
     struct mmap_record *next;
 };
 
@@ -55,6 +59,22 @@ struct mmap_record {
  * memory mutex via __memory_lock / __memory_unlock).
  * Defined in mmap.c; declared here for munmap.c / mprotect.c / msync.c.  */
 extern struct mmap_record * volatile __mmap_records;
+
+/* Free every record (and its backing allocation) created by the given
+ * per-process context.  Called from the stdlib_mmap_exit destructor so
+ * that mappings leaked by an exiting process (e.g. never munmap()'d, or
+ * "unmapped" via an interior pointer, which is a silent no-op) do not
+ * survive until reboot.  Defined in mmap.c.                              */
+void __mmap_records_free_for(struct _clib4 *owner);
+
+/* Restore MEMATTRF_READ_WRITE over a mapping's user pages ([user_ptr,
+ * user_ptr + hdr->length)) before the backing block is FreeVec'd.  Must be
+ * called while the in-page header is still valid (i.e. BEFORE hdr->magic is
+ * invalidated).  No-op (cheap early-out) when the header says the mapping is
+ * still PROT_WRITE-able — PROT_WRITE always maps to MEMATTRF_READ_WRITE — or
+ * when the header is unreadable/invalid (free proceeds as before).
+ * Defined in mmap.c; used by munmap() and the exit sweep.                 */
+void __mmap_restore_rw(void *user_ptr);
 
 /* Get the in-page header for a user pointer produced by our mmap().
  * Used only for read-only metadata access (mprotect, msync, writeback).

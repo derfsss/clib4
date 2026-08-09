@@ -66,6 +66,17 @@ munmap(void *map, size_t length) {
         struct mmap_header *hdr = __mmap_get_header(map);
         if (hdr != NULL) {
             __mmap_writeback(hdr, map, hdr->length);
+        }
+
+        /* If mprotect() left pages inside this mapping under restrictive
+         * protection (PROT_READ / PROT_NONE guard pages), FreeVec on them
+         * can DSI in kernel context when exec later writes free-list
+         * metadata into the pages — restore MEMATTRF_READ_WRITE first.
+         * Must run while the in-page header is still valid (before the
+         * magic invalidation below).  No-op when the mapping is still RW. */
+        __mmap_restore_rw(map);
+
+        if (hdr != NULL) {
             hdr->magic = 0; /* Invalidate to catch double-munmap early */
         }
 
