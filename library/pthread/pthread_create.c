@@ -65,6 +65,74 @@ extern struct DOSIFace *_IDOS;
 #define PTHREAD_CREATE_FAILED(reason) \
     DebugPrintF("[clib4 pthread_create] FAILED (returning EAGAIN): %s\n", (reason))
 
+/*
+ * How the child process gets its three DOS standard handles.
+ *
+ * The dup exists to TRANSFER OWNERSHIP: NP_CloseInput/Output/Error TRUE tells
+ * DOS to close the child's handles when it exits, and that must not close the
+ * parent's.  So the rule is simply: dup transfers ownership; when we cannot
+ * dup, we borrow instead of owning.  Three cases:
+ *
+ *   src == ZERO       The parent has no such stream.  Pass NOTHING (TAG_IGNORE
+ *                     on both tags) and let the child have none either.  Per
+ *                     dos.doc, ErrorOutput() "will generally return ZERO
+ *                     unless someone specifically opens an error output
+ *                     stream" and DupFileHandle(ZERO) "always returns ZERO",
+ *                     so this is the DOCUMENTED GENERAL CASE, not an error.
+ *                     clib4's own stdio already treats it as such:
+ *                     library/stdio/file_init.c:202 guards with
+ *                     `if (default_file != BZERO)' and initialises stderr
+ *                     regardless.  Refusing to create a thread for a process
+ *                     that merely lacks an error stream was the bug.
+ *
+ *   dup OK            Pass the dup, NP_Close* TRUE.  Unchanged behaviour.
+ *
+ *   dup FAILED on a   Still fatal (EAGAIN), and still named on the serial log.
+ *   non-ZERO handle   The handle is real and DupFileHandle genuinely refused
+ *                     it, so silently substituting something else would be a
+ *                     different decision from this one.  Treated separately.
+ */
+struct handle_pass {
+    ULONG tag;        /* NP_Input / NP_Output / NP_Error, or TAG_IGNORE   */
+    BPTR  fh;
+    LONG  close;      /* TRUE only when the CHILD OWNS the handle         */
+};
+
+/*
+ * ⛔ The NP_Close* tag is ALWAYS passed explicitly by the caller and is never
+ * TAG_IGNOREd, because the DOS defaults are the dangerous way round:
+ *
+ *     dos.doc:3383  NP_CloseInput  ... Defaults to TRUE.
+ *     dos.doc:3392  NP_CloseOutput ... Defaults to TRUE.
+ *
+ * Omitting the tag therefore tells DOS to CLOSE the child's input/output on
+ * exit -- and when NP_Input/NP_Output were also omitted, that stream is
+ * whatever DOS defaulted the child to, which may be the parent's.  A child
+ * thread exiting would then close the process's own stdout.  So this struct
+ * carries only the boolean; the tag itself is spelled out at the call site
+ * where it cannot be lost.  (NP_Error is the exception that proves it:
+ * dos.doc:3396 defaults it to a ZERO stream, which is why omitting THAT one
+ * is safe -- but it is not omitted either, for symmetry.)
+ */
+static BOOL
+resolve_handle(struct handle_pass *hp, BPTR *owned, BPTR src, ULONG tag) {
+    *owned = BZERO;
+
+    if (src == BZERO) {
+        /* Documented general case; give the child no such stream, and make
+         * certain it does not close a defaulted one on the way out. */
+        hp->tag = TAG_IGNORE;  hp->fh = BZERO;  hp->close = FALSE;
+        return TRUE;
+    }
+
+    *owned = DupFileHandle(src);
+    if (*owned == BZERO)
+        return FALSE;   /* a REAL handle that could not be duplicated */
+
+    hp->tag = tag;  hp->fh = *owned;  hp->close = TRUE;
+    return TRUE;
+}
+
 static APTR
 hook_function(struct Hook *hook, APTR userdata, struct Process *process) {
     uint32 pid = (uint32) userdata;
@@ -352,13 +420,16 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
     pthread_t threadnew;
     struct Task *thisTask = FindTask(NULL);
     struct DOSIFace *IDOS = _IDOS;
+	/* fileIn/Out/Err are the dups WE created and therefore must clean up on
+	 * the error path.  They stay BZERO when the handle was absent or was
+	 * borrowed rather than duplicated -- see resolve_handle(). */
 	BPTR fileIn  = BZERO;
 	BPTR fileOut = BZERO;
 	BPTR fileErr = BZERO;
+	struct handle_pass hpIn, hpOut, hpErr;
 	struct newThreadMessage *newThreadMessage = NULL;
 	struct MsgPort *msgPort = NULL;
-	/* Set at the DupFileHandle failure so the shared out: path can say which
-	 * of its two entry conditions fired.  See PTHREAD_CREATE_FAILED below. */
+	/* Which failure path fired, for PTHREAD_CREATE_FAILED on the out: path. */
 	const char *failwhy = "CreateNewProcTags() returned 0";
 
     if (thread == NULL || start == NULL)
@@ -448,19 +519,20 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
     name[sizeof(name) - 1] = '\0';
     strncpy(inf->name, name, NAMELEN);
 
-    fileIn  = DupFileHandle(Input());
-    fileOut = DupFileHandle(Output());
-    fileErr = DupFileHandle(ErrorOutput());
-    if (!fileIn || !fileOut || !fileErr) {
-        /* ErrorOutput() is legitimately ZERO for a process with no separate
-         * error stream, and DupFileHandle(ZERO) is ZERO -- so this path is
-         * reachable from how the program was LAUNCHED, with no memory
-         * pressure and no defect anywhere.  That makes it the one failure
-         * here that can differ between two runs of byte-identical binaries,
-         * which is exactly why it has to name which handle was missing. */
-        failwhy = !fileIn  ? "DupFileHandle(Input()) returned ZERO"
-                : !fileOut ? "DupFileHandle(Output()) returned ZERO"
-                           : "DupFileHandle(ErrorOutput()) returned ZERO";
+    /* A ZERO source handle is the documented general case and no longer fails
+     * thread creation -- see resolve_handle() above.  A REAL handle that
+     * cannot be duplicated is still fatal here; that case is separate and is
+     * dealt with in its own commit. */
+    if (!resolve_handle(&hpIn, &fileIn, Input(), NP_Input)) {
+        failwhy = "DupFileHandle(Input()) failed on a non-ZERO handle";
+        goto out;
+    }
+    if (!resolve_handle(&hpOut, &fileOut, Output(), NP_Output)) {
+        failwhy = "DupFileHandle(Output()) failed on a non-ZERO handle";
+        goto out;
+    }
+    if (!resolve_handle(&hpErr, &fileErr, ErrorOutput(), NP_Error)) {
+        failwhy = "DupFileHandle(ErrorOutput()) failed on a non-ZERO handle";
         goto out;
     }
 
@@ -471,12 +543,14 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
             inf->attr.stacksize == 0 ? TAG_IGNORE : NP_StackSize, inf->attr.stacksize,
             NP_Name,                 name,
             NP_Child,                TRUE,
-            NP_Input,			     fileIn,
-            NP_CloseInput,		     TRUE,
-            NP_Output,			     fileOut,
-            NP_CloseOutput,		     TRUE,
-            NP_Error,			     fileErr,
-            NP_CloseError,		     TRUE,
+            /* NP_Close* spelled out and never TAG_IGNOREd -- their DOS
+             * defaults are TRUE.  See resolve_handle() above. */
+            hpIn.tag,                hpIn.fh,
+            NP_CloseInput,           hpIn.close,
+            hpOut.tag,               hpOut.fh,
+            NP_CloseOutput,          hpOut.close,
+            hpErr.tag,               hpErr.fh,
+            NP_CloseError,           hpErr.close,
             NP_EntryData,			 newThreadMessage,
             TAG_DONE);
 
