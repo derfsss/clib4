@@ -39,6 +39,32 @@
 
 extern struct DOSIFace *_IDOS;
 
+/*
+ * pthread_create() has five distinct failure paths and POSIX gives it exactly
+ * one error code to report them with, EAGAIN.  Worse, the code is the RETURN
+ * VALUE, not errno, and the most important caller on this platform throws it
+ * away: OpenJDK's CallJavaMainInNewThread (java_md.c) tests
+ * `pthread_create(...) == 0' and on failure silently runs JavaMain on the
+ * primary process instead, with the comment "just give it a try..".  The VM
+ * then behaves subtly differently for the rest of its life and nothing
+ * anywhere records why.
+ *
+ * So say it on the serial log, unconditionally.  This is the same channel the
+ * DOS ELF loader uses for "[DOS ELF_LS] ERROR: ... Elf32_Error=10", it is
+ * already captured on every guest run, and it costs nothing when no thread
+ * creation ever fails.  Precedent for unconditional DebugPrintF from library
+ * code: library/stdio/fread.c:248, library/wmem/wmem_core.c:241.
+ *
+ * This deliberately does NOT change the returned code -- EAGAIN is
+ * POSIX-conformant for every one of these paths and callers may rely on it.
+ * Making the failure loud and making it a different errno are separate
+ * decisions; only the first is safe to take unilaterally.
+ */
+#define STR_(x) #x
+#define STR(x)  STR_(x)
+#define PTHREAD_CREATE_FAILED(reason) \
+    DebugPrintF("[clib4 pthread_create] FAILED (returning EAGAIN): %s\n", (reason))
+
 static APTR
 hook_function(struct Hook *hook, APTR userdata, struct Process *process) {
     uint32 pid = (uint32) userdata;
@@ -331,6 +357,9 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
 	BPTR fileErr = BZERO;
 	struct newThreadMessage *newThreadMessage = NULL;
 	struct MsgPort *msgPort = NULL;
+	/* Set at the DupFileHandle failure so the shared out: path can say which
+	 * of its two entry conditions fired.  See PTHREAD_CREATE_FAILED below. */
+	const char *failwhy = "CreateNewProcTags() returned 0";
 
     if (thread == NULL || start == NULL)
         return EINVAL;
@@ -340,6 +369,7 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
     threadnew = GetThreadId(NULL);
     if (threadnew == PTHREAD_THREADS_MAX) {
         MutexRelease(thread_sem);
+        PTHREAD_CREATE_FAILED("all " STR(PTHREAD_THREADS_MAX) " thread slots in use");
         return EAGAIN;
     }
 
@@ -363,15 +393,26 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
     inf->detached = inf->attr.detachstate == PTHREAD_CREATE_DETACHED;
     inf->timerOpen = FALSE;
     
-    /* Signals allocated lazily in StarterFunc (thread context) */
+    /* Signals allocated lazily in StarterFunc (thread context).
+     *
+     * join_signal MUST be initialised here for the same reason cancel_signal
+     * is.  _pthread_clear_threadinfo() memset()s the slot to zero, so an
+     * uninitialised join_signal reads back as 0 -- which is not the "unset"
+     * sentinel (-1) but signal bit 0, SIGB_ABORT.  The out: error path below
+     * frees any join_signal != -1, so every pthread_create() that failed
+     * before StarterFunc ran was calling FreeSignal(0) on the CALLER's task,
+     * releasing a system-reserved signal bit the caller never allocated. */
     inf->cancel_signal = -1;
     inf->cancel_signal_mask = 0;
+    inf->join_signal = -1;
+    inf->join_signal_mask = 0;
 
     msgPort = AllocSysObject(ASOT_PORT, NULL);
     if (msgPort == 0) {
         SHOWMSG("Cannot allocate message port\n");
         _pthread_clear_threadinfo(inf); // Release the reserved slot back to IDLE
         MutexRelease(thread_sem);
+        PTHREAD_CREATE_FAILED("AllocSysObject(ASOT_PORT) returned 0 (out of memory)");
         return EAGAIN;
     }
 
@@ -387,6 +428,7 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
         
         _pthread_clear_threadinfo(inf); // Release the reserved slot back to IDLE
         MutexRelease(thread_sem);
+        PTHREAD_CREATE_FAILED("AllocSysObjectTags(ASOT_MESSAGE) returned NULL (out of memory)");
         return EAGAIN;
     }
 
@@ -409,8 +451,18 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
     fileIn  = DupFileHandle(Input());
     fileOut = DupFileHandle(Output());
     fileErr = DupFileHandle(ErrorOutput());
-    if (!fileIn || !fileOut || !fileErr)
+    if (!fileIn || !fileOut || !fileErr) {
+        /* ErrorOutput() is legitimately ZERO for a process with no separate
+         * error stream, and DupFileHandle(ZERO) is ZERO -- so this path is
+         * reachable from how the program was LAUNCHED, with no memory
+         * pressure and no defect anywhere.  That makes it the one failure
+         * here that can differ between two runs of byte-identical binaries,
+         * which is exactly why it has to name which handle was missing. */
+        failwhy = !fileIn  ? "DupFileHandle(Input()) returned ZERO"
+                : !fileOut ? "DupFileHandle(Output()) returned ZERO"
+                           : "DupFileHandle(ErrorOutput()) returned ZERO";
         goto out;
+    }
 
     // start the child thread
     inf->task = CreateNewProcTags(
@@ -455,6 +507,7 @@ out:
     	}
         _pthread_clear_threadinfo(inf); // Release the reserved slot back to IDLE
         MutexRelease(thread_sem);
+        PTHREAD_CREATE_FAILED(failwhy);
         return EAGAIN;
     }
 
