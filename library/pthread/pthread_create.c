@@ -73,8 +73,9 @@ extern struct DOSIFace *_IDOS;
  * parent's.  So the rule is simply: dup transfers ownership; when we cannot
  * dup, we borrow instead of owning.  Three cases:
  *
- *   src == ZERO       The parent has no such stream.  Pass NOTHING (TAG_IGNORE
- *                     on both tags) and let the child have none either.  Per
+ *   src == ZERO       The parent has no such stream.  TAG_IGNORE the handle
+ *                     tag (but NEVER the NP_Close* one -- see below) and let
+ *                     the child have none either.  Per
  *                     dos.doc, ErrorOutput() "will generally return ZERO
  *                     unless someone specifically opens an error output
  *                     stream" and DupFileHandle(ZERO) "always returns ZERO",
@@ -87,10 +88,38 @@ extern struct DOSIFace *_IDOS;
  *
  *   dup OK            Pass the dup, NP_Close* TRUE.  Unchanged behaviour.
  *
- *   dup FAILED on a   Still fatal (EAGAIN), and still named on the serial log.
- *   non-ZERO handle   The handle is real and DupFileHandle genuinely refused
- *                     it, so silently substituting something else would be a
- *                     different decision from this one.  Treated separately.
+ *   dup FAILED on a   The handle is real and DupFileHandle genuinely refused
+ *   non-ZERO handle   it -- in practice a pipe, IoErr()==ERROR_OBJECT_IN_USE
+ *                     (202), which is what every capture harness produces for
+ *                     stdout.  Pass the ORIGINAL handle with NP_Close* FALSE:
+ *                     the child borrows the parent's stream and DOS will not
+ *                     close it on the child's exit.
+ *
+ * Why borrowing is the right answer for that third case, rather than
+ * substituting ZERO or NIL: -- both of which would have made the symptom go
+ * away just as well, and silently:
+ *
+ *   1. It is what POSIX already promises.  Threads share the process's
+ *      streams; they do not get private copies.
+ *   2. clib4 itself already borrows these very handles.  file_init.c captures
+ *      Input()/Output()/ErrorOutput() ONCE into the per-process __clib4 fd
+ *      table and flags them FDF_NO_CLOSE_BPTR -- clib4 has never owned them.
+ *      A pthread's printf() resolves through that shared table, NOT through
+ *      the child Process's pr_COS, so the child's DOS handles are near-
+ *      vestigial for clib4 I/O.  Borrowing keeps the DOS-level view
+ *      consistent with the stdio-level view that already exists.
+ *   3. ZERO or NIL: would discard a thread's DOS-level output with nothing
+ *      recording that it had happened -- a plausible wrong answer, which is
+ *      the one outcome this library must not produce.
+ *
+ * The honest risk, stated rather than hidden: two DOS Processes then hold one
+ * FileHandle, and AmigaOS FileHandles are not reentrant, so concurrent writes
+ * can interleave.  That hazard is NOT new -- the shared __clib4 fd table has
+ * exactly the same property today -- and POSIX makes interleaving on a shared
+ * stream the caller's problem.  The second risk is lifetime: a borrowed handle
+ * must outlive the child.  __pthread_exit_func cancels and joins every live
+ * thread before the process tears down, which bounds it.  Neither risk is
+ * silent: every borrow is reported below.
  */
 struct handle_pass {
     ULONG tag;        /* NP_Input / NP_Output / NP_Error, or TAG_IGNORE   */
@@ -114,23 +143,30 @@ struct handle_pass {
  * dos.doc:3396 defaults it to a ZERO stream, which is why omitting THAT one
  * is safe -- but it is not omitted either, for symmetry.)
  */
-static BOOL
-resolve_handle(struct handle_pass *hp, BPTR *owned, BPTR src, ULONG tag) {
+static void
+resolve_handle(struct handle_pass *hp, BPTR *owned, BPTR src,
+               ULONG tag, const char *what) {
     *owned = BZERO;
 
     if (src == BZERO) {
         /* Documented general case; give the child no such stream, and make
          * certain it does not close a defaulted one on the way out. */
         hp->tag = TAG_IGNORE;  hp->fh = BZERO;  hp->close = FALSE;
-        return TRUE;
+        return;
     }
 
     *owned = DupFileHandle(src);
-    if (*owned == BZERO)
-        return FALSE;   /* a REAL handle that could not be duplicated */
+    if (*owned != BZERO) {
+        hp->tag = tag;  hp->fh = *owned;  hp->close = TRUE;
+        return;
+    }
 
-    hp->tag = tag;  hp->fh = *owned;  hp->close = TRUE;
-    return TRUE;
+    /* Real handle, refused dup (pipes give ERROR_OBJECT_IN_USE == 202).
+     * Borrow it: the child uses the parent's stream and must not close it. */
+    DebugPrintF("[clib4 pthread_create] DupFileHandle(%s) failed, IoErr=%ld; "
+                "child will BORROW the parent's handle (not closed on exit)\n",
+                what, (long) IoErr());
+    hp->tag = tag;  hp->fh = src;  hp->close = FALSE;
 }
 
 static APTR
@@ -429,8 +465,6 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
 	struct handle_pass hpIn, hpOut, hpErr;
 	struct newThreadMessage *newThreadMessage = NULL;
 	struct MsgPort *msgPort = NULL;
-	/* Which failure path fired, for PTHREAD_CREATE_FAILED on the out: path. */
-	const char *failwhy = "CreateNewProcTags() returned 0";
 
     if (thread == NULL || start == NULL)
         return EINVAL;
@@ -519,22 +553,13 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
     name[sizeof(name) - 1] = '\0';
     strncpy(inf->name, name, NAMELEN);
 
-    /* A ZERO source handle is the documented general case and no longer fails
-     * thread creation -- see resolve_handle() above.  A REAL handle that
-     * cannot be duplicated is still fatal here; that case is separate and is
-     * dealt with in its own commit. */
-    if (!resolve_handle(&hpIn, &fileIn, Input(), NP_Input)) {
-        failwhy = "DupFileHandle(Input()) failed on a non-ZERO handle";
-        goto out;
-    }
-    if (!resolve_handle(&hpOut, &fileOut, Output(), NP_Output)) {
-        failwhy = "DupFileHandle(Output()) failed on a non-ZERO handle";
-        goto out;
-    }
-    if (!resolve_handle(&hpErr, &fileErr, ErrorOutput(), NP_Error)) {
-        failwhy = "DupFileHandle(ErrorOutput()) failed on a non-ZERO handle";
-        goto out;
-    }
+    /* See resolve_handle() above: a ZERO source handle is the documented
+     * general case and a refused dup is borrowed, not fatal.  Neither can
+     * fail pthread_create any more, so there is no `goto out' here now --
+     * only CreateNewProcTags can still fail below. */
+    resolve_handle(&hpIn,  &fileIn,  Input(),       NP_Input,  "Input()");
+    resolve_handle(&hpOut, &fileOut, Output(),      NP_Output, "Output()");
+    resolve_handle(&hpErr, &fileErr, ErrorOutput(), NP_Error,  "ErrorOutput()");
 
     // start the child thread
     inf->task = CreateNewProcTags(
@@ -554,7 +579,9 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(voi
             NP_EntryData,			 newThreadMessage,
             TAG_DONE);
 
-out:
+    /* Reached by fall-through only.  The former `out:' label is gone with the
+     * DupFileHandle bail-out that was its only goto; CreateNewProcTags is now
+     * the sole way pthread_create can fail here. */
     if (0 == inf->task) {
         if (fileIn)
             Close(fileIn);
@@ -581,7 +608,7 @@ out:
     	}
         _pthread_clear_threadinfo(inf); // Release the reserved slot back to IDLE
         MutexRelease(thread_sem);
-        PTHREAD_CREATE_FAILED(failwhy);
+        PTHREAD_CREATE_FAILED("CreateNewProcTags() returned 0");
         return EAGAIN;
     }
 
