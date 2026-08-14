@@ -643,13 +643,36 @@ __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, s
         SHOWMSG("we have to deal with sockets");
 #endif
 
-        /* Wait for file input, too? */
-        if ((total_file_fd > 0) && (timeout == NULL || timeout->tv_sec > 0 || timeout->tv_usec > 0)) {
+        /* Wait for file input, too?
+         *
+         * The clause that used to sit here also required a NON-ZERO timeout:
+         *
+         *     && (timeout == NULL || timeout->tv_sec > 0 || timeout->tv_usec > 0)
+         *
+         * so a mixed socket+file select with a {0,0} timeout - which is what
+         * Java's selectNow() compiles down to - fell through to the sockets-only
+         * arm below.  That arm never looks at file_read_fds/file_write_fds, and
+         * because those sets still hold everything map_descriptor_sets() put in
+         * them, remap_descriptor_sets() at the bottom of this function then
+         * reported EVERY file descriptor ready.  Worse, the return value did not
+         * count them: the caller got rc==0 alongside a full set of ready bits,
+         * i.e. poll() returning 0 with POLLIN in revents.
+         *
+         * This was left alone deliberately until now.  While the FDF_POLL arm of
+         * the loop below asked WaitForChar(Input()) about every descriptor, the
+         * one-pass answer it would have produced was "nothing ready" - trading a
+         * harmless wrong answer for a LOST WAKEUP, which is a hang.  That arm now
+         * asks the descriptor's own stream (previous commit, R-25), so the pass
+         * gives the right answer and this clause can go.
+         */
+        if (total_file_fd > 0) {
             struct DateStamp stop_when;
             struct timeval zero;
             ULONG break_mask;
             BOOL got_input;
             BOOL got_output;
+            BOOL poll_once;
+            BOOL have_deadline;
 
 #ifdef SOCKET_DEBUG
             SHOWMSG("we also have to deal with files");
@@ -728,7 +751,15 @@ __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, s
              * can be used to fake input to a console stream,
              * but I'd rather not rely upon it.
              */
-            if (timeout != NULL) {
+            /* A {0,0} timeout is POSIX for "test and return at once" and is not
+             * a deadline at all.  Spell it as its own flag rather than leaning
+             * on stop_when == now and CompareDates() tie-breaking at DateStamp's
+             * 1/50s granularity: the exit must not depend on clock resolution.
+             * Same shape as the files-only loop below (:1013). */
+            poll_once = (timeout != NULL && timeout->tv_sec == 0 && timeout->tv_usec == 0);
+            have_deadline = (timeout != NULL && NOT poll_once);
+
+            if (have_deadline) {
                 struct DateStamp datestamp_timeout;
 
                 DateStamp(&stop_when);
@@ -916,13 +947,23 @@ __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, s
                     break;
 
                 /* If a timeout was set, check if we are already beyond the point of time when we should have stopped polling. */
-                if (timeout != NULL) {
+                if (have_deadline) {
                     struct DateStamp now;
                     DateStamp(&now);
 
+                    /* CompareDates() is inverted with respect to strcmp(): it
+                     * returns <= 0 when the first date is the later one.  So
+                     * this reads "now has reached stop_when". */
                     if (CompareDates(&now, &stop_when) <= 0)
                         break;
                 }
+
+                /* Non-blocking test: one pass over the sockets and the files is
+                 * the whole of the contract, ready or not.  Placed after the
+                 * readiness checks above, so a {0,0} poll still REPORTS what is
+                 * ready - it just does not wait for more. */
+                if (poll_once)
+                    break;
 
                 /* No I/O ready yet. Delay a tick to avoid busy-waiting, restore
                  * the sets and retry. Delay is placed here rather than at the top
