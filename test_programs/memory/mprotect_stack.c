@@ -20,6 +20,14 @@
  *   S4  main (CLI) task stack page, same protect/restore sequence
  *   S5  from main, protect a parked sibling pthread's low stack page
  *       (the sibling sits in sem_wait)
+ *   S7  THE DISCRIMINATOR for gate 2f / R-3, and SAFE (mmap page only, no
+ *       stack): PROT_NONE round trip with the MMU attributes read back at
+ *       each step.  Decides whether the restore failure is clib4's
+ *       attrs==0 sentinel misreading a valid page, or the MMU refusing the
+ *       transition.  Run this before S2/S3.
+ *   S8  DANGEROUS, run LAST and alone: does GetMemoryAttrs distinguish an
+ *       unmapped VA from a mapped PROT_NONE one?  Probes addresses we do
+ *       not own and may DSI or suspend the task silently.
  *
  * Safety: only ever the LOWEST page of a stack is touched, far below the
  * live SP; it is restored immediately; nothing recurses between protect
@@ -398,14 +406,176 @@ run_s5(void)
     return result;
 }
 
+/* ------------------------------------------------------------------ S7 */
+/*
+ * S7 -- THE DISCRIMINATOR for gate 2f / R-3.  SAFE: no stack page is
+ * touched, only an mmap()'d page of our own.
+ *
+ * It reads the MMU attributes back at each step of a PROT_NONE round trip,
+ * which is the one measurement that separates the two live explanations of
+ * "restore after PROT_NONE returns -1":
+ *
+ *   H1  clib4's own probe-then-commit guard rejects the restore.
+ *       mprotect maps PROT_NONE to MEMATTRF_SUPER_RW, and
+ *       MEMATTRF_SUPER_RW == (0L<<6) == 0 (SDK exec/memory.h:209), so a
+ *       PROT_NONE page with default cache policy reads back as attrs == 0
+ *       -- which the old guard treated as "unmapped" and refused.
+ *       => PREDICTS  A1 == 0x00000000.
+ *
+ *   H2  the OS4 MMU refuses the transition out of no-access, i.e.
+ *       SetMemoryAttrs itself will not take a page from SUPER_RW back to
+ *       SUPER_RW_USER_RW.
+ *       => PREDICTS  A1 != 0 (the page still describes itself), and, on a
+ *          clib4 whose guard has been fixed, A2 != READ_WRITE after a
+ *          restore that reported rc == 0.
+ *
+ * The two predictions are mutually exclusive on A1, so one run decides it.
+ *
+ * Note this case uses an mmap() page deliberately.  If the failure
+ * reproduces here, R-3 is NOT a stack-page defect and has nothing to do
+ * with issue #431 or with guard pages -- it is address-class independent,
+ * and the whole "HotSpot guard page" framing of the risk is wrong.  If it
+ * does NOT reproduce here but S3 still fails, the opposite holds and the
+ * stack VA is essential.  Either answer is worth the run.
+ *
+ * Expected attribute values for reference (SDK exec/memory.h:209-213):
+ *   MEMATTRF_SUPER_RW         = 0x000  (PROT_NONE:  user no access)
+ *   MEMATTRF_SUPER_RW_USER_RW = 0x080  (PROT_READ|PROT_WRITE)
+ *   MEMATTRF_SUPER_RO_USER_RO = 0x0C0  (PROT_READ)
+ *   MEMATTRF_NOT_MAPPED       = 0x400  (returned for unmapped memory)
+ */
+static int
+run_s7(void)
+{
+    ULONG a0 = 0, a1 = 0, a2 = 0;
+    int rc_none, rc_restore;
+    int result = 0;
+
+    MARK("S7", "start (PROT_NONE round trip on an mmap page, "
+               "with GetMemoryAttrs readback at each step)");
+
+    void *m = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) {
+        MARK("S7", "mmap FAILED");
+        return 1;
+    }
+
+    if (probe_attrs("S7", "mmap-page/initial-RW", m, &a0) != 0)
+        result = 1;
+
+    rc_none = mprotect_reported("S7", "mmap-page", m, PROT_NONE,
+                                "PROT_NONE", "apply");
+
+    /* THE MEASUREMENT.  Read the attributes back while the page is under
+     * PROT_NONE, without going through mprotect (whose guard is the thing
+     * under test). */
+    if (probe_attrs("S7", "mmap-page/under-PROT_NONE", m, &a1) != 0)
+        result = 1;
+
+    rc_restore = mprotect_reported("S7", "mmap-page", m,
+                                   PROT_READ | PROT_WRITE,
+                                   "PROT_READ|PROT_WRITE", "restore");
+
+    if (probe_attrs("S7", "mmap-page/after-restore", m, &a2) != 0)
+        result = 1;
+
+    MARK("S7", "SUMMARY attrs: initial=0x%08lx under-PROT_NONE=0x%08lx "
+               "after-restore=0x%08lx | rc(PROT_NONE)=%d rc(restore)=%d",
+         (unsigned long) a0, (unsigned long) a1, (unsigned long) a2,
+         rc_none, rc_restore);
+    MARK("S7", "VERDICT: under-PROT_NONE attrs %s -- %s",
+         a1 == 0 ? "== 0" : "!= 0",
+         a1 == 0 ? "H1 (clib4's attrs==0 sentinel misreads a valid page)"
+                 : "H2 (not the sentinel; look at SetMemoryAttrs itself)");
+
+    munmap(m, PAGE_SIZE);
+
+    if (rc_none != 0 || rc_restore != 0)
+        result = 1;
+
+    MARK("S7", "%s", result == 0 ? "PASS" : "FAIL");
+    return result;
+}
+
+/* ------------------------------------------------------------------ S8 */
+/*
+ * S8 -- can GetMemoryAttrs tell "unmapped" from "mapped but PROT_NONE"?
+ *
+ * DANGER: this is the one case here that deliberately probes addresses we
+ * do not own.  It may DSI, and a DSI inside SuperState can suspend the task
+ * silently rather than trapping.  RUN IT LAST, ALONE, AND EXPECT TO NEED A
+ * REBOOT.  A marker is printed before every single probe so the serial log
+ * attributes the death to one exact address.
+ *
+ * Why it is worth the risk: clib4's mprotect guard must decide, from a
+ * GetMemoryAttrs result alone, whether a page is mapped.  Since PROT_NONE
+ * pages read back as 0 (see S7), the guard can only work if genuinely
+ * unmapped VAs read back as something else -- the header promises
+ * MEMATTRF_NOT_MAPPED (0x400).
+ *
+ *   attrs == 0x400 (or NOT_MAPPED set) on the unmapped candidates
+ *       => the header is right, the guard is sound, done.
+ *   attrs == 0 on an unmapped candidate
+ *       => 0 is AMBIGUOUS between unmapped and PROT_NONE.  The guard cannot
+ *          be made both safe and correct with GetMemoryAttrs alone, and
+ *          clib4 must instead decide mapped-ness from __mmap_records plus
+ *          the caller's own stack bounds.  This is the more important and
+ *          more expensive outcome.
+ *   a DSI / silent suspend inside the probe
+ *       => GetMemoryAttrs FAULTS on unmapped VAs, which is issue #431's top
+ *          hypothesis and review finding A2.  The probe-then-commit design
+ *          is then unsalvageable as written: it relocates the fault into
+ *          SuperState instead of preventing it.
+ *
+ * All three answers change what clib4 should do.  There is no outcome here
+ * that is merely confirmatory.
+ */
+static int
+run_s8(void)
+{
+    static const struct { const char *what; uintptr_t va; } cand[] = {
+        /* Ordered least to most likely to be genuinely unmapped, so the log
+         * shows how far the walk got before anything went wrong. */
+        { "low-memory-page-1",  0x00001000UL },
+        { "mid-hole-0x50000000", 0x50000000UL },
+        { "high-hole-0x7FF00000", 0x7FF00000UL },
+    };
+    ULONG attrs;
+    size_t i;
+    int result = 0;
+
+    MARK("S8", "start -- DANGEROUS: probing addresses we do not own. "
+               "A silent stop after any 'before' line below means "
+               "GetMemoryAttrs FAULTED on that address.");
+
+    for (i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+        attrs = 0xDEADBEEFUL;
+        if (probe_attrs("S8", cand[i].what, (void *) cand[i].va, &attrs) != 0) {
+            result = 1;
+            continue;
+        }
+        MARK("S8", "%s (%p): attrs=0x%08lx -> %s", cand[i].what,
+             (void *) cand[i].va, (unsigned long) attrs,
+             (attrs & 0x400UL) ? "MEMATTRF_NOT_MAPPED set (header is right)"
+             : attrs == 0 ? "ZERO -- AMBIGUOUS with a PROT_NONE page"
+                          : "mapped, some other attributes");
+    }
+
+    MARK("S8", "survived all probes (no fault)");
+    MARK("S8", "%s", result == 0 ? "PASS" : "FAIL");
+    return result;
+}
+
 /* ---------------------------------------------------------------- main */
 
 int
 main(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("usage: %s S1|S2|S3|S4|S5|S6\n", argv[0]);
-        printf("recommended order (safe cases first): S6 S1 S2 S3 S4 S5\n");
+        printf("usage: %s S1|S2|S3|S4|S5|S6|S7|S8\n", argv[0]);
+        printf("recommended order (safe cases first): S6 S7 S1 S2 S3 S4 S5\n");
+        printf("S8 is DANGEROUS (probes unowned addresses) -- run it LAST\n");
         printf("run one case per invocation so a crash cannot mask the rest\n");
         return 1;
     }
@@ -422,6 +592,10 @@ main(int argc, char **argv)
         return run_s5();
     if (strcmp(argv[1], "S6") == 0)
         return run_s6();
+    if (strcmp(argv[1], "S7") == 0)
+        return run_s7();
+    if (strcmp(argv[1], "S8") == 0)
+        return run_s8();
 
     printf("unknown case '%s'\n", argv[1]);
     return 1;
