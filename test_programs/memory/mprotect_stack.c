@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -132,7 +133,45 @@ probe_attrs(const char *case_name, const char *what, void *addr, ULONG *out)
     return 0;
 }
 
-/* mprotect + restore with markers around each call.  restore_prot is
+/* One mprotect() call, with errno captured and reported.
+ *
+ * errno is reported on EVERY call, not only the failing ones: a run where
+ * rc=0 and errno is untouched is the baseline that makes a reported errno
+ * on the failing call interpretable.  Two things make that honest:
+ *
+ *   1. errno is CLEARED before the call.  POSIX only guarantees errno is
+ *      meaningful after a failure, so on success it otherwise holds
+ *      whatever the last failing libc call in this process left there --
+ *      printing that would be a plausible wrong answer, which is worse
+ *      than printing nothing.
+ *   2. errno is SAVED into a local immediately after the call, before the
+ *      printf.  printf/fflush are libc calls and may set errno themselves.
+ *
+ * Reported as both the number and strerror(), because the number alone is
+ * not portable reading across a serial log and strerror() alone loses the
+ * distinction if clib4 has no string for the value.
+ */
+static int
+mprotect_reported(const char *case_name, const char *what, void *addr,
+                  int prot, const char *prot_name, const char *phase)
+{
+    int rc, saved_errno;
+
+    MARK(case_name, "before %s mprotect(%p, %lu, %s) [%s]",
+         phase, addr, PAGE_SIZE, prot_name, what);
+
+    errno = 0;
+    rc = mprotect(addr, PAGE_SIZE, prot);
+    saved_errno = errno;
+
+    MARK(case_name, "after %s mprotect(%p, %s) [%s] -> rc=%d errno=%d (%s)",
+         phase, addr, prot_name, what, rc, saved_errno,
+         strerror(saved_errno));
+
+    return rc;
+}
+
+/* mprotect + restore with markers around each call.  The restore is
  * applied whether or not the first call succeeded (best effort).         */
 static int
 protect_restore(const char *case_name, const char *what, void *addr,
@@ -140,16 +179,9 @@ protect_restore(const char *case_name, const char *what, void *addr,
 {
     int rc1, rc2;
 
-    MARK(case_name, "before mprotect(%p, %lu, %s) [%s]",
-         addr, PAGE_SIZE, prot_name, what);
-    rc1 = mprotect(addr, PAGE_SIZE, prot);
-    MARK(case_name, "after mprotect(%p, %s) [%s] -> rc=%d", addr, prot_name,
-         what, rc1);
-
-    MARK(case_name, "before restore mprotect(%p, %lu, PROT_READ|PROT_WRITE) [%s]",
-         addr, PAGE_SIZE, what);
-    rc2 = mprotect(addr, PAGE_SIZE, PROT_READ | PROT_WRITE);
-    MARK(case_name, "after restore mprotect(%p) [%s] -> rc=%d", addr, what, rc2);
+    rc1 = mprotect_reported(case_name, what, addr, prot, prot_name, "apply");
+    rc2 = mprotect_reported(case_name, what, addr, PROT_READ | PROT_WRITE,
+                            "PROT_READ|PROT_WRITE", "restore");
 
     return (rc1 == 0 && rc2 == 0) ? 0 : -1;
 }
