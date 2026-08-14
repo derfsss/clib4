@@ -443,6 +443,67 @@ get_num_descriptors_used(struct _clib4 *__clib4, int num_fds, int *num_socket_us
     (*num_file_used_ptr) = num_file_used;
 }
 
+/* Verdicts from file_input_state().  UNKNOWN is not a third flavour of "no":
+ * it means the stream offers no way to ask the question at all, and the
+ * caller has to decide what to do about that. */
+#define FILE_INPUT_NONE     0
+#define FILE_INPUT_READY    1
+#define FILE_INPUT_UNKNOWN  2
+
+/*
+ * Ask a non-socket descriptor whether a read() would find anything waiting.
+ *
+ * This is the test that FDF_POLL descriptors used to skip entirely.  poll()
+ * stamps FDF_POLL on every descriptor it maps (library/posix/poll.c:64) and
+ * select_signal then declared every one of them readable without asking any
+ * question of the stream.  A poll() whose descriptors are always ready is a
+ * poll() whose timeout has no effect: it returns immediately, every time,
+ * which turns every NIO select loop on this platform into a 100% CPU spin.
+ *
+ * Returning UNKNOWN rather than NONE when there is no oracle is deliberate.
+ * Reporting "not ready" for a stream we cannot interrogate would convert a
+ * busy loop into a missed wakeup, and a missed wakeup is a hang.  A spin is
+ * the failure we can see; keep it as the fallback, and let the caller decide.
+ */
+static int
+file_input_state(struct fd *fd, int file_descriptor) {
+    struct ExamineData *fib;
+    int state;
+
+    /* Interactive streams answer the question directly.  STDIN is asked
+     * through Input(), because that is the handle the process actually
+     * reads from - the same rule the non-poll arms of the loops below use. */
+    if (FLAG_IS_SET(fd->fd_Flags, FDF_IS_INTERACTIVE)) {
+        BPTR handle = (file_descriptor == STDIN_FILENO) ? Input() : fd->fd_File;
+
+        return WaitForChar(handle, 1) ? FILE_INPUT_READY : FILE_INPUT_NONE;
+    }
+
+    /* Everything else - disk files, pipes, handler streams - is measured by
+     * asking the file system how much data is there. */
+    fib = ExamineObjectTags(EX_FileHandleInput, fd->fd_File, TAG_DONE);
+    if (fib == NULL) {
+        /* A handler that does not implement ACTION_EXAMINE_FH fails here with
+         * ERROR_ACTION_NOT_KNOWN, and so does a genuine error.  Either way we
+         * cannot tell, and saying so is better than inventing an answer.
+         * Whether AmigaOS PIPE: lands here is the single open question behind
+         * this change - test_programs/pipe/poll_timing.c P0 measures it. */
+        return FILE_INPUT_UNKNOWN;
+    }
+
+    if (FLAG_IS_SET(fd->fd_Flags, FDF_CACHE_POSITION)) {
+        /* Seekable file: readable if there are bytes beyond where we are. */
+        state = ((ULONG) fib->FileSize > fd->fd_Position) ? FILE_INPUT_READY : FILE_INPUT_NONE;
+    } else {
+        /* Pipe or handler stream: anything queued at all is readable. */
+        state = (fib->FileSize != 0) ? FILE_INPUT_READY : FILE_INPUT_NONE;
+    }
+
+    FreeDosObject(DOS_EXAMINEDATA, fib);
+
+    return state;
+}
+
 int
 __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, struct timeval *timeout, ULONG *signal_mask_ptr) {
     fd_set *backup_socket_read_fds = NULL;
@@ -871,6 +932,8 @@ __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, s
         struct DateStamp stop_when;
         BOOL got_input;
         BOOL got_output;
+        BOOL poll_once;
+        BOOL have_deadline;
 
 #ifdef SOCKET_DEBUG
         SHOWMSG("we have to deal with files");
@@ -895,7 +958,21 @@ __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, s
             }
         }
 
-        if (timeout != NULL && (timeout->tv_sec > 0 || timeout->tv_usec > 0)) {
+        /* A {0,0} timeout means "test the descriptors and return at once" -
+         * that is how POSIX spells a non-blocking select/poll - and it is NOT
+         * the same as no timeout at all.  The loop below consults its deadline
+         * only when it has one, so with a zero timeout and nothing readable it
+         * had no exit condition whatsoever and span forever on Delay(1).
+         *
+         * That was invisible while every FDF_POLL descriptor reported itself
+         * ready: result > 0 always broke the loop one line earlier.  The moment
+         * readiness is tested for real - the change above - the hang becomes
+         * reachable, which is why the two must land in the same commit.
+         * select(0, NULL, NULL, NULL, &{0,0}) hangs today for the same reason. */
+        poll_once = (timeout != NULL && timeout->tv_sec == 0 && timeout->tv_usec == 0);
+        have_deadline = (timeout != NULL && NOT poll_once);
+
+        if (have_deadline) {
             struct DateStamp datestamp_timeout;
             DateStamp(&stop_when);
 
@@ -927,7 +1004,17 @@ __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, s
 #ifdef SOCKET_DEBUG
                                 SHOWVALUE("FLAG_IS_SET(fd->fd_Flags, FDF_POLL)");
 #endif
-                                got_input = TRUE;
+                                /* Was: got_input = TRUE, unconditionally.  A
+                                 * descriptor under poll() control is not
+                                 * readable by virtue of being under poll()
+                                 * control; ask the stream. */
+                                if (file_input_state(fd, i) != FILE_INPUT_NONE) {
+                                    /* READY, or UNKNOWN - see file_input_state():
+                                     * with no oracle we stay permissive, which
+                                     * reproduces the old behaviour exactly and
+                                     * cannot turn a working wakeup into a hang. */
+                                    got_input = TRUE;
+                                }
                             }
                             else if (FLAG_IS_SET(fd->fd_Flags, FDF_TERMIOS)) {
 #ifdef SOCKET_DEBUG
@@ -1011,13 +1098,21 @@ __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, s
             if (result > 0)
                 break;
 
-            if (timeout != NULL && (timeout->tv_sec > 0 || timeout->tv_usec > 0)) {
+            if (have_deadline) {
                 struct DateStamp now;
                 DateStamp(&now);
 
+                /* CompareDates() is inverted with respect to strcmp(): it
+                 * returns <= 0 when the first date is the later one.  So this
+                 * reads "now has reached stop_when". */
                 if (CompareDates(&now, &stop_when) <= 0)
                     break;
             }
+
+            /* Non-blocking test: one pass over the descriptors is the whole of
+             * the contract, ready or not. */
+            if (poll_once)
+                break;
 
             /* Delay a tick to avoid busy-waiting. Placed at the end so that
              * data available on the first iteration is returned immediately. */
