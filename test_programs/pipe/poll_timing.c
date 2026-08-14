@@ -35,9 +35,17 @@
  *
  * SAFETY
  * ------
- * Steps P0..P7 cannot hang: every poll() in them carries a bounded timeout and
- * every one of them returns immediately on the CURRENT library (that is the
- * bug).  Step P8 is different and is NOT run by default:
+ * Steps P0..P7 and P9..P12 carry a bounded timeout in every poll() call, so
+ * none of them can hang on a library whose loops honour their deadline.
+ *
+ * [!] P9 and P10 are the exception worth naming: they are the FIRST rows to
+ * take the mixed socket+file branch with a {0,0} timeout, which before the
+ * poll_once fix in that branch had no exit condition of its own and leaned on a
+ * DateStamp tie.  If the run stops after "[P9] ..." with nothing following, the
+ * mixed loop's zero-timeout exit is the answer.  P11a/P11/P12 open a loopback
+ * TCP connection; if the stack cannot, they report NOT TESTED rather than FAIL.
+ *
+ * Step P8 is different again and is NOT run by default:
  *
  *      poll_timing hang
  *
@@ -449,10 +457,10 @@ probe_pollnval(int rfd) {
 }
 
 /* ------------------------------------------------------------------ P6/P7 -
- * The mixed socket+file path, select_signal.c:685-852.  It is a different
- * branch of __select() and it has its own suspected defect: at :746-750 a
- * poll()'d descriptor's readability is taken from WaitForChar(Input()) -- the
- * PROCESS'S STDIN -- rather than from the descriptor's own handle.
+ * The mixed socket+file path, a different branch of __select() from the one
+ * P1..P4 exercise.  It had its own defect: a poll()'d descriptor's readability
+ * was taken from WaitForChar(Input()) -- the PROCESS'S STDIN -- rather than
+ * from the descriptor's own handle.
  *
  * * Gate R-16f ("wakeup seen") CANNOT refute that: if the selector had no
  *   sockets registered it took the files-only path, where the old code called
@@ -461,8 +469,14 @@ probe_pollnval(int rfd) {
  *
  * P6: socket + pipe, both idle, 300 ms  -> must block ~300 ms.
  * P7: socket + pipe, pipe HAS a byte    -> must report the pipe readable.
- *     [!] If P7 fails while P4 passes, :746-750 is implicated and the fix is to
- *     use the descriptor's own handle there.  If P7 passes, leave it alone.
+ *     [!] If P7 fails while P4 passes, the mixed FDF_POLL arm is implicated and
+ *     the fix is to use the descriptor's own handle there.
+ *
+ * STATUS: P7 FAILED on qemu-java (boot017/018/019) while P4 passed, twice, with
+ * the byte demonstrably readable afterwards.  That is R-25.  The fix is in
+ * select_signal.c:856-865 -- file_input_state(fd, i), the same oracle the
+ * files-only arm uses at :1078.  P7 is now a REGRESSION row: a red P7 on a
+ * library carrying that fix refutes it outright.
  */
 static void
 probe_mixed(int rfd, int wfd) {
@@ -544,6 +558,217 @@ probe_mixed(int rfd, int wfd) {
     close(s);
 }
 
+/* ---------------------------------------------------------------- P9..P12 -
+ * The mixed path under a ZERO timeout, and the proof that fixing the pipe did
+ * not cost us the socket.
+ *
+ * P6/P7 above both use a 300 ms timeout, so neither of them touches the branch
+ * that a mixed selectNow() takes.  Before the widening, a mixed select with a
+ * {0,0} timeout fell through to the sockets-only arm of __select, which never
+ * looks at the file sets at all -- and because those sets still hold everything
+ * that was mapped into them, remap_descriptor_sets() reported EVERY file
+ * descriptor ready.  P10 is the row that sees that: an empty pipe reported
+ * readable is the old behaviour, not the new one.
+ *
+ * [!] AND THE ROW THAT MATTERS MOST HERE IS P11, because a "fix" for P7 that
+ * made the pipe visible by breaking socket readiness would be worse than R-25
+ * ever was.  P11 is deliberately paired with P11a, a SOCKETS-ONLY poll on the
+ * same listener, which goes down the arm of __select that was not touched:
+ *
+ *      P11a ready, P11 not  -> the MIXED path lost the socket.  Convicted.
+ *      P11a not ready       -> the connection never landed.  Says nothing about
+ *                              select at all; P11/P12 are reported UNTESTED.
+ *
+ * Without P11a a red P11 cannot be told apart from a loopback stack that does
+ * not complete a handshake, and the wrong conclusion is the attractive one.
+ *
+ * The client connection is made ONCE and left un-accepted, so the listener
+ * stays readable across P11a, P11 and P12.
+ */
+static void
+probe_mixed_zero_timeout(int rfd, int wfd) {
+    struct pollfd p[2];
+    struct sockaddr_in sa;
+    socklen_t salen;
+    long long t0, dt;
+    int s = -1, c = -1, a = -1;
+    int rc, drained, sock_ready;
+
+    say("\n=== P9..P12  mixed socket + pipe, zero timeout and socket readiness ===\n");
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+        say("[P9] INFO  socket() failed errno=%d (%s) -- NOT TESTED\n",
+            errno, strerror(errno));
+        unknowns++;
+        return;
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = 0;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(s, (struct sockaddr *) &sa, sizeof(sa)) < 0 || listen(s, 1) < 0) {
+        say("[P9] INFO  bind/listen failed errno=%d (%s) -- NOT TESTED\n",
+            errno, strerror(errno));
+        close(s);
+        unknowns++;
+        return;
+    }
+
+    /* ---- P9: mixed selectNow, byte ALREADY in the pipe ---- */
+    if (write(wfd, "Z", 1) != 1) {
+        info("P9", "write failed -- NOT TESTED");
+        unknowns++;
+        close(s);
+        return;
+    }
+
+    p[0].fd = s;   p[0].events = POLLIN; p[0].revents = 0;
+    p[1].fd = rfd; p[1].events = POLLIN; p[1].revents = 0;
+
+    t0 = now_ms();
+    rc = poll(p, 2, 0);
+    dt = now_ms() - t0;
+
+    say("[P9] rc=%d sock.revents=0x%x pipe.revents=0x%x elapsed=%lldms\n",
+        rc, (unsigned) p[0].revents, (unsigned) p[1].revents, dt);
+
+    drained = drain(rfd);
+    say("[P9] bytes actually readable: %d (1 was written)\n", drained);
+
+    verdict("P9", dt < 100, "a mixed selectNow returns at once (a hang here is "
+                            "the {0,0} exit condition in the mixed loop)");
+    verdict("P9", (p[1].revents & POLLIN) != 0 && drained == 1,
+            "a mixed selectNow sees the byte in the pipe -- this is the shape "
+            "Selector.selectNow() uses to collect a pending wakeup");
+    verdict("P9", rc >= 1,
+            "and COUNTS it: rc must agree with the bits it set");
+
+    /* ---- P10: mixed selectNow, pipe EMPTY ---- */
+    p[0].fd = s;   p[0].events = POLLIN; p[0].revents = 0;
+    p[1].fd = rfd; p[1].events = POLLIN; p[1].revents = 0;
+
+    t0 = now_ms();
+    rc = poll(p, 2, 0);
+    dt = now_ms() - t0;
+
+    say("[P10] rc=%d sock.revents=0x%x pipe.revents=0x%x elapsed=%lldms\n",
+        rc, (unsigned) p[0].revents, (unsigned) p[1].revents, dt);
+
+    verdict("P10", dt < 100, "returns at once");
+    verdict("P10", (p[1].revents & POLLIN) == 0,
+            "[!] an EMPTY pipe is NOT reported readable.  Failing here means the "
+            "mixed zero-timeout case is still falling through to the "
+            "sockets-only arm, which reports every mapped file ready");
+    verdict("P10", rc == 0, "and rc == 0 agrees with that");
+
+    /* ---- bring a real connection in, once, and leave it un-accepted ---- */
+    salen = sizeof(sa);
+    memset(&sa, 0, sizeof(sa));
+    if (getsockname(s, (struct sockaddr *) &sa, &salen) < 0) {
+        say("[P11] INFO  getsockname failed errno=%d (%s) -- socket-readiness "
+            "rows NOT TESTED\n", errno, strerror(errno));
+        unknowns++;
+        close(s);
+        return;
+    }
+
+    say("[P11] listener bound to 127.0.0.1:%u\n", (unsigned) ntohs(sa.sin_port));
+
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0) {
+        say("[P11] INFO  client socket() failed errno=%d (%s) -- NOT TESTED\n",
+            errno, strerror(errno));
+        unknowns++;
+        close(s);
+        return;
+    }
+
+    if (connect(c, (struct sockaddr *) &sa, sizeof(sa)) < 0 && errno != EINPROGRESS) {
+        say("[P11] INFO  connect to loopback failed errno=%d (%s) -- socket "
+            "readiness NOT TESTED (this says nothing about select)\n",
+            errno, strerror(errno));
+        unknowns++;
+        close(c);
+        close(s);
+        return;
+    }
+
+    /* ---- P11a: the CONTROL.  Sockets only, so it takes the arm of __select
+     *      that neither change touched. ---- */
+    p[0].fd = s; p[0].events = POLLIN; p[0].revents = 0;
+
+    t0 = now_ms();
+    rc = poll(p, 1, 1000);
+    dt = now_ms() - t0;
+
+    sock_ready = (rc >= 1 && (p[0].revents & POLLIN) != 0);
+
+    say("[P11a] sockets-only poll(listener, 1000): rc=%d revents=0x%x "
+        "elapsed=%lldms\n", rc, (unsigned) p[0].revents, dt);
+
+    if (!sock_ready) {
+        say("[P11a] INFO  the connection never made the listener readable on the "
+            "UNTOUCHED sockets-only path.  P11/P12 are therefore NOT TESTED: a "
+            "red P11 here would measure the network stack, not select().\n");
+        unknowns++;
+        close(c);
+        close(s);
+        return;
+    }
+
+    /* ---- P11: the same question through the MIXED path, pipe empty ---- */
+    p[0].fd = s;   p[0].events = POLLIN; p[0].revents = 0;
+    p[1].fd = rfd; p[1].events = POLLIN; p[1].revents = 0;
+
+    t0 = now_ms();
+    rc = poll(p, 2, 1000);
+    dt = now_ms() - t0;
+
+    say("[P11] mixed poll(listener+pipe, 1000): rc=%d sock.revents=0x%x "
+        "pipe.revents=0x%x elapsed=%lldms\n",
+        rc, (unsigned) p[0].revents, (unsigned) p[1].revents, dt);
+
+    verdict("P11", (p[0].revents & POLLIN) != 0,
+            "[!] the mixed path still sees a READY SOCKET.  P11a proved the "
+            "socket is ready; failing here means fixing the pipe cost us the "
+            "socket, which is worse than R-25");
+    verdict("P11", (p[1].revents & POLLIN) == 0,
+            "and does not invent readiness for the empty pipe alongside it");
+
+    /* ---- P12: both ready at once, zero timeout ---- */
+    if (write(wfd, "B", 1) != 1) {
+        info("P12", "write failed -- NOT TESTED");
+        unknowns++;
+    } else {
+        p[0].fd = s;   p[0].events = POLLIN; p[0].revents = 0;
+        p[1].fd = rfd; p[1].events = POLLIN; p[1].revents = 0;
+
+        t0 = now_ms();
+        rc = poll(p, 2, 0);
+        dt = now_ms() - t0;
+
+        say("[P12] rc=%d sock.revents=0x%x pipe.revents=0x%x elapsed=%lldms\n",
+            rc, (unsigned) p[0].revents, (unsigned) p[1].revents, dt);
+
+        drained = drain(rfd);
+        say("[P12] bytes actually readable: %d (1 was written)\n", drained);
+
+        verdict("P12", (p[0].revents & POLLIN) != 0 && (p[1].revents & POLLIN) != 0,
+                "a zero-timeout mixed poll reports BOTH ready descriptors");
+        verdict("P12", rc == 2, "and counts both of them");
+        verdict("P12", dt < 100, "without waiting");
+    }
+
+    a = accept(s, NULL, NULL);
+    if (a >= 0)
+        close(a);
+    close(c);
+    close(s);
+}
+
 /* ------------------------------------------------------------------ P8 ---
  * [!] OPT-IN ONLY.  Hangs forever on a library without the zero-timeout fix.
  */
@@ -598,6 +823,7 @@ main(int argc, char **argv) {
     probe_ready_now(fds[0], fds[1]);
     probe_pollnval(fds[0]);
     probe_mixed(fds[0], fds[1]);
+    probe_mixed_zero_timeout(fds[0], fds[1]);
 
     if (run_hang)
         probe_empty_select_zero_timeout();
