@@ -803,9 +803,35 @@ __select(int num_fds, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, s
                     if (fd != NULL) {
                         if (file_read_fds != NULL && FD_ISSET(i, file_read_fds)) {
                             if (FLAG_IS_SET(fd->fd_Flags, FDF_READ)) {
-                                /* Is this a poll socket? */
+                                /* Is this a poll socket?
+                                 *
+                                 * Was: WaitForChar(Input(), 1) -- the PROCESS'S
+                                 * STDIN, for every poll()'d descriptor whatever
+                                 * it actually was.  A pipe with a byte in it was
+                                 * therefore reported not-readable unless someone
+                                 * happened to be typing at the console, which is
+                                 * how Selector.wakeup() went missing the moment a
+                                 * socket was registered alongside the wakeup pipe
+                                 * (R-25; poll_timing P7 failed while P4, the same
+                                 * question on the files-only path, passed).
+                                 *
+                                 * Ask the descriptor's own stream instead. This is
+                                 * the same oracle the files-only arm uses at the
+                                 * bottom of this function, on the same fd, and it
+                                 * is measured: poll_timing P4 (byte present ->
+                                 * READY) and P1 (empty pipe -> NONE, 318ms of a
+                                 * 300ms timeout) are file_input_state() answering
+                                 * about exactly this descriptor. */
                                 if (FLAG_IS_SET(fd->fd_Flags, FDF_POLL)) {
-                                    if (WaitForChar(Input(), 1)) {
+                                    if (file_input_state(fd, i) != FILE_INPUT_NONE) {
+                                        /* READY, or UNKNOWN. Permissive on UNKNOWN
+                                         * for the reason given at file_input_state():
+                                         * a stream we cannot interrogate must not be
+                                         * declared dead, because a missed wakeup is a
+                                         * hang and a spin is only a spin.  Note this
+                                         * is strictly MORE permissive than the line
+                                         * it replaces, which answered FALSE for every
+                                         * descriptor that was not the console. */
                                         got_input = TRUE;
                                     }
                                 }
