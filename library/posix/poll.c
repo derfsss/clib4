@@ -11,7 +11,7 @@
 #endif /* _SOCKET_HEADERS_H */
 
 static int
-map_poll_spec(struct pollfd *pArray, nfds_t n_fds, fd_set *pReadSet, fd_set *pWriteSet, fd_set *pExceptSet, BOOL *stdin_set_raw) {
+map_poll_spec(struct pollfd *pArray, nfds_t n_fds, fd_set *pReadSet, fd_set *pWriteSet, fd_set *pExceptSet, BOOL *stdin_set_raw, int *n_invalid) {
     register nfds_t i;             /* loop control */
     register struct pollfd *pCur;  /* current array element */
     register int max_fd = -1;      /* return value */
@@ -20,6 +20,7 @@ map_poll_spec(struct pollfd *pArray, nfds_t n_fds, fd_set *pReadSet, fd_set *pWr
     ENTER();
 
     *stdin_set_raw = FALSE;
+    *n_invalid = 0;
 
     SHOWPOINTER(pArray);
     SHOWVALUE(n_fds);
@@ -32,14 +33,22 @@ map_poll_spec(struct pollfd *pArray, nfds_t n_fds, fd_set *pReadSet, fd_set *pWr
        by select().
     */
     for (i = 0, pCur = pArray; i < n_fds; i++, pCur++) {
-        /* Skip any bad FDs in the array. */
+        /* POSIX: revents is an output-only field and must be cleared on every
+           entry, including the ones we go on to ignore. Doing it here (rather
+           than in map_select_results) is what lets POLLNVAL, set below,
+           survive: map_select_results can then tell "we set this" from
+           "the caller left it lying around". */
+        pCur->revents = 0;
 
+        /* Skip any bad FDs in the array. POSIX: "If fd is negative, events
+           shall be ignored and revents shall be set to zero." */
         if (pCur->fd < 0)
             continue;
 
         struct fd *fd = __get_file_descriptor(__clib4, pCur->fd);
         if (fd == NULL) {
             pCur->revents = POLLNVAL;
+            (*n_invalid)++;
             continue;
         }
 
@@ -147,6 +156,13 @@ map_select_results(struct pollfd *pArray, unsigned long n_fds, fd_set *pReadSet,
         if (pCur->fd < 0)
             continue;
 
+        /* map_poll_spec already rejected this descriptor and recorded why.
+           Clearing revents here would destroy that verdict and hand the
+           caller a silent "nothing happened" for a descriptor that is not
+           usable at all. */
+        if (pCur->revents & POLLNVAL)
+            continue;
+
         pCur->revents = 0;
         if (FD_ISSET(pCur->fd, pExceptSet)) {
             pCur->revents |= POLLPRI;
@@ -207,6 +223,7 @@ __poll(struct pollfd *fds, nfds_t nfds, int timeout, uint32_t *signals) {
     int max_fd;                                 /* maximum fd value */
     struct timeval *pTimeout;                   /* actually passed */
     BOOL stdin_set_raw = FALSE;
+    int n_invalid = 0;                          /* descriptors that got POLLNVAL */
 
     if ((fds == NULL) && (nfds != 0)) {
         __set_errno(EFAULT);
@@ -220,9 +237,17 @@ __poll(struct pollfd *fds, nfds_t nfds, int timeout, uint32_t *signals) {
     memset(&stime, 0, sizeof(stime));
 
     /* Map the poll() file descriptor list in the select() data structures. */
-    max_fd = map_poll_spec(fds, nfds, &read_descs, &write_descs, &except_descs, &stdin_set_raw);
+    max_fd = map_poll_spec(fds, nfds, &read_descs, &write_descs, &except_descs, &stdin_set_raw, &n_invalid);
 
     /* Map the poll() timeout value in the select() timeout structure. */
+    if (n_invalid > 0) {
+        /* At least one descriptor already has an event pending (POLLNVAL), so
+           poll() must not block: the caller is entitled to be told about the
+           bad descriptor now rather than after the full timeout has elapsed.
+           A bad descriptor that costs the caller its whole timeout is the
+           quietest way to turn a programming error into a stall. */
+        timeout = 0;
+    }
     pTimeout = map_timeout(timeout, &stime);
 
     /* Make the select() call. */
@@ -233,6 +258,11 @@ __poll(struct pollfd *fds, nfds_t nfds, int timeout, uint32_t *signals) {
 
     if (ready_descriptors >= 0) {
         map_select_results(fds, nfds, &read_descs, &write_descs, &except_descs);
+
+        /* POSIX: poll() returns the number of descriptors with a non-zero
+           revents, and POLLNVAL is a non-zero revents. select() cannot have
+           counted these: it was never shown them. */
+        ready_descriptors += n_invalid;
     }
 
     /* Restore stdin cooked mode and clear temporary flags. */
